@@ -1,14 +1,69 @@
 library(kuenm2)
 library(terra)
 library(geodata)
+library(CoordinateCleaner)
+library(rgbif)
+library(dplyr)
+#####1.Data#####
+#Github
+species_name = "Atta sexdens"
 
+occ = occ_search(
+  scientificName = species_name,
+  hasCoordinate = TRUE,
+  limit = 200000
+)
+dados = occ$data
 
-#tratamento da planilha
-data <-read.csv("D:/GABI_Data_Release1.0_18012020/GABI_Data_Release1.0_18012020/GABI_Data_Release1.0_18012020.csv") 
+#GABI
+data <-read.csv("D:/GABI_Data_Release1.0_18012020/GABI_Data_Release1.0_18012020/GABI_Data_Release1.0_18012020.csv") # unique (species, lat, lon, month, year) records
 data <- subset (data, valid_species_name == "Atta.sexdens")
 data <- subset(data,select = c("valid_species_name","dec_long","dec_lat"))
 data$dec_long <- as.numeric(data$dec_long)
 data$dec_lat <- as.numeric(data$dec_lat)
+#merge dos dados
+dados <- subset(dados,select = c("scientificName","decimalLongitude","decimalLatitude"))
+dados <- dados %>% 
+  rename(valid_species_name = scientificName, dec_long = decimalLongitude,dec_lat = decimalLatitude)
+data <- full_join(data, dados)
+#limpar o merge
+# Remover coordenadas ausentes
+data = data %>%
+  filter(
+    !is.na(dec_long),
+    !is.na(dec_lat)
+  )
+# Limpeza com CoordinateCleaner
+
+data = clean_coordinates(
+  x = data,
+  lon = "dec_long",
+  lat = "dec_lat",
+  species = "valid_species_name",
+  tests = c(
+    "capitals",
+    "centroids",
+    "gbif",
+    "institutions",
+    "zeros",
+    "seas"
+  ))
+# manter apenas registros aprovados
+data = data[data$.summary, ]
+
+# Remover dados duplicados
+
+data = data %>%
+  distinct(
+    dec_long,
+    dec_lat,
+    .keep_all = TRUE
+  )
+data <- subset(data,select = c("valid_species_name","dec_long","dec_lat"))
+write.csv(data,file = "Attasexdens.csv")
+
+####Lendo os dados####
+data <-read.csv("D:/GABI_Data_Release1.0_18012020/GABI_Data_Release1.0_18012020/GABI_Data_Release1.0_18012020.csv")
 #carregar as variaveis climaticas
 bio01 <- rast("D:/wc2.1_2.5m_bio/wc2.1_2.5m_bio_1.tif")
 bio02 <- rast("D:/wc2.1_2.5m_bio/wc2.1_2.5m_bio_2.tif")
@@ -44,34 +99,38 @@ occ_data<- initial_cleaning(data, "valid_species_name", "dec_long", "dec_lat",
                             remove_duplicates = TRUE, by_decimal_precision = TRUE,
                             decimal_precision = 0, longitude_precision = NULL,
                             latitude_precision = NULL)
+write.csv(occ_data,"ENMs/Atta sexdens/occurrences.csv")
+M <- vect("ENMs/Atta sexdens/M_simulation/M_simulation_2_SD_1000_events_4_rep10/accessible_area_M.shp")
+plot(M)
 
-Ne_ext <- c(-120, -20, -60, 40)
 
-# crop wrclim data for Holarctic
-var_crop <- crop(var1, ext(Ne_ext))
-writeRaster(var_crop, "varcrop.tif", overwrite=TRUE)
+# 3.2 crop and mask bioclimatic variables to M
+M_var <- crop(var1, M, mask = T) 
+plot(M_var[[1]])
+Ne_ext <- ext(c(-120, -20, -60, 40))
+Ne_extrast <- rast(Ne_ext)
 G_curr <- crop(var1,Ne_ext)
+writeRaster(G_curr,"ENMs/G_vars/Present/G_curr.tiff")
 dir.create("ENMs/Atta sexdens/Maxnet", recursive = TRUE)
 dir.create("ENMs/Atta sexdens/PCA_Mvars", recursive = TRUE)
 biasfile = rast("BiasFile/bias_raster.tif")
 
 bias_file <- resample(x = biasfile, 
-                               y = var_crop,
+                               y = M_var,
                                method = "bilinear")
-
-
-sp <- prepare_data(algorithm = "maxnet", occ = occ_data , x = "dec_long", y = "dec_lat", raster_variables = var_crop, species = "Atta.sexdens",
+bias_crop <- crop(bias_file,M,mask = T)
+sp <- prepare_data(algorithm = "maxnet", occ = occ_data , x = "dec_long", y = "dec_lat", raster_variables = M_var, species = "Atta.sexdens",
                    n_background = 400, features = c("l", "q", "p", "lq", "lqp"),
                    r_multiplier = c(0.1, 0.25, 0.5, 0.75, 1, 2,3,4,5), partition_method = "kfolds",
                    n_partitions = 4, train_proportion = 0.7,
                    seed = 42,
                    do_pca = TRUE,
                    min_explained = 1,
-                   min_number = 4,
+                   min_number = 2,
                    center = TRUE,
                    scale = TRUE,
                    write_pca = TRUE,
-                   bias_file = bias_file,
+                   bias_file = bias_crop,
                    bias_effect = "direct",
                    pca_directory = "ENMs/Atta sexdens/PCA_Mvars",
                    write_file = TRUE,
@@ -80,10 +139,10 @@ print(sp)
 
 
 
-calibrado <- calibration(data = sp, error_considered = 5,
+calibrado <- calibration(data = sp, error_considered = 2,
                          remove_concave = TRUE,
                          proc_for_all = FALSE, 
-                         omission_rate = 5, 
+                         omission_rate = 2, 
                          delta_aic = 2,
                          allow_tolerance = TRUE, 
                          tolerance = 0.01,
@@ -97,19 +156,24 @@ calibrado <- calibration(data = sp, error_considered = 5,
                          progress_bar = TRUE,
                          verbose = TRUE)
 print(calibrado)
-partition_response_curves(calibrado, 256, n = 100,
-                          averages_from = "pr_bg", col = "darkblue",
-                          ylim = NULL, las = 1, parallel = FALSE,
-                          ncores = NULL)
+bivariate_response(models = fm, variable1 = "bio_1", variable2 = "bio_15", 
+                   modelID = "Model_192", add_bar = FALSE, main = "Model 192")
 encaixado <- fit_selected(calibration_results = calibrado,
                           n_replicates = 10, 
-                          write_models = F,
+                          write_models =F ,
                           parallel = TRUE, 
                           ncores = 6,
                           progress_bar = TRUE, 
                           verbose = TRUE, 
                           seed = 42)
-
+imp <- variable_importance(models = encaixado)
+plot_importance(imp)
+imp_terms <- variable_importance(models = encaixado, by_terms = TRUE, 
+                                 progress_bar = FALSE)
+imp_terms
+par(cex = 0.7, mar = c(3, 4, 2.5, 0.5))  # Set grid of plot
+plot_importance(imp_terms, main = "Importance of variable terms")
+curvas_resposta <- all_response_curves(encaixado)
 selected_table <- encaixado$selected_models
 selected_table$species <- "Atta sexdens"
 dir.create("ENMs/Atta sexdens/Maxnet/maxnet_selected_models")
@@ -138,15 +202,15 @@ predict_present <- readRDS("ENMs/Atta sexdens/Maxnet/predict_present.rds")
 dir.create("ENMs/Atta sexdens/Maxnet/Response_curves")
 
 # 7.1  mean curve
-resp_curves <- all_response_curves(
-  models = encaixado,
-  predictors = G_curr,
-  out_dir = "ENMs/Atta sexdens/Maxnet/Response_curves"
+resp_curves <- all_response_curves(encaixado
+  
 )
 
-par(mfrow = c(1,2)) #Set grid of plot
-response_curve(models = encaixado, variable = "PC1") # quite nice curve
-response_curve(models = encaixado, variable = "PC2") # don't know why it's not showing
+write.csv(resp_curves, "ENMs/Atta sexdens/Maxnet/Response_curves")
+
+par(mfrow = c(3,5)) #Set grid of plot
+response_curve(models = encaixado, variable = "PC3") # quite nice curve
+response_curve(models = encaixado, variable = "PC5") # don't know why it's not showing
 
 geodata_dir <- file.path("ENMs/Future_worldclim")
 dir.create(geodata_dir)
@@ -170,11 +234,10 @@ out_dir_future <- file.path("ENMs/Future_worldclim")
 organize_future_worldclim(input_dir = in_dir, #Path to the raw variables from WorldClim
                           output_dir = out_dir_future,
                           variables = c("bio_1","bio_2","bio_3","bio_4","bio_5","bio_6","bio_7","bio_10","bio_11","bio_12","bio_13","bio_14","bio_15","bio_16","bio_17"),
-                          name_format = "bio_", mask = m_ext,overwrite = TRUE) 
-
+                          name_format = "bio_", mask = Ne_ext,overwrite = TRUE) 
 
 projetado <- prepare_projection(models = encaixado,
-                                present_dir = "ENMs/Var", #Directory with present-day variables
+                                present_dir = "ENMs/G_vars/Present", #Directory with present-day variables
                                 past_dir = NULL, #NULL because we won't project to the past
                                 past_period = NULL, #NULL because we won't project to the past
                                 past_gcm = NULL, #NULL because we won't project to the past
@@ -251,3 +314,4 @@ mop <- projection_mop(
 # PLOT
 plot(rast("ENMs/Atta sexdens/Maxnet/MOP/Present/Present_mopbasic.tif"))
 plot(rast("ENMs/Atta sexdens/Maxnet/MOP/Future/2081-2100/ssp245/ACCESS-CM2_mopbasic.tif"))
+
